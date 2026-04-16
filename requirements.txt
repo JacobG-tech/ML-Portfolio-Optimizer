@@ -12,3 +12,4 @@ plotly
 streamlit
 jupyter
 ipykernel
+lxml
