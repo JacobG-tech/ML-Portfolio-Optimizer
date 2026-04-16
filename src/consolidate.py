@@ -16,6 +16,7 @@ def load_ticker(path):
     # Flatten multi-level columns: yfinance returns (metric, ticker) tuples
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
+    df.columns.name = None
 
     # Normalize column names to lowercase with underscores
     df.columns = df.columns.str.lower().str.replace(" ", "_")
