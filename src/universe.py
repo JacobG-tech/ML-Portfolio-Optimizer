@@ -20,7 +20,6 @@ def get_failed_companies():
     failures = pd.DataFrame([
         {"ticker": "AIG", "name": "AIG", "reason": "Bailout/near-collapse 2008"},
         {"ticker": "FNMA", "name": "Fannie Mae", "reason": "Conservatorship 2008"},
-        {"ticker": "CFC", "name": "Countrywide Financial", "reason": "Acquired 2008"},
         {"ticker": "BLIAQ", "name": "Blockbuster", "reason": "Bankruptcy 2010"},
         {"ticker": "BBBY", "name": "Bed Bath & Beyond", "reason": "Bankruptcy 2023"},
         {"ticker": "FRCB", "name": "First Republic Bank", "reason": "FDIC seizure 2023"},

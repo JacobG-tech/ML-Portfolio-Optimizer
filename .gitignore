@@ -205,3 +205,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Generated data (regenerate by running src/download.py)
+data/raw/prices/*.parquet
+data/processed/*.parquet
+data/predictions/*.parquet
