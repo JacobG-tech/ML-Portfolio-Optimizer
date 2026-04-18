@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 
 FORWARD_WINDOW = 21
 DRAWDOWN_THRESHOLD = 0.05
@@ -39,8 +40,10 @@ def add_target_dd5_21d(panel):
         )
         # Drawdown from entry price
         forward_dd = forward_min / prices - 1
-        # Binary flag
-        return (forward_dd < -DRAWDOWN_THRESHOLD).astype(int)
+        # Binary flag, preserving NaN where forward window is incomplete
+        flag = (forward_dd < -DRAWDOWN_THRESHOLD).astype(float)
+        flag[forward_dd.isna()] = np.nan
+        return flag
 
     panel["target_dd5_21d"] = (
         panel.groupby("ticker")["adj_close"]
