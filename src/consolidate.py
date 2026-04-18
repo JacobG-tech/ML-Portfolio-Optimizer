@@ -25,8 +25,10 @@ def load_ticker(path):
     df = df.reset_index()
     df.columns = df.columns.str.lower()
 
-    # Add ticker column
-    df["ticker"] = ticker
+    # Add ticker column. Translate hyphens back to periods (we use hyphens
+    # only for filenames because Windows/yfinance constraints; periods are
+    # the canonical ticker format used in universe.csv and sectors.csv).
+    df["ticker"] = ticker.replace("-", ".")
 
     return df
 
