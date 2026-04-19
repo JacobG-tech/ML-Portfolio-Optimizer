@@ -222,8 +222,9 @@ def add_rank_features(panel, feature_cols):
     """Add per-date cross-sectional rank-transformed versions of features.
 
     For each date, each feature value is replaced by its rank across all
-    tickers on that date, normalized to [0, 1] via rank/(N-1). This makes
-    features regime-invariant: a rank of 0.9 means "top 10% of today's
+    tickers on that date, normalized to (0, 1] via pandas' pct=True option (equivalent to rank/N).
+    The lowest-ranked ticker on each date gets 1/N, the highest gets 1.0.
+    This makes features regime-invariant: a rank of 0.9 means "top 10% of today's
     universe" regardless of whether today is a calm market or a crash.
 
     Ties are handled with method='average' (standard quant convention).

@@ -2,7 +2,7 @@
 
 For each of 8 annual validation folds:
 1. Split fold's training set into inner-train + inner-val (last 10% by date)
-2. Train XGBRegressor for forward 21-day return (MSE loss)
+2. Train XGBRegressor for forward return (MSE loss)
 3. Train XGBClassifier for >5% drawdown in next 21 days (log loss)
 4. Use inner-val for XGBoost early stopping
 5. Predict on the outer validation fold
@@ -11,13 +11,18 @@ For each of 8 annual validation folds:
 Fold 1 runs ~30 Optuna TPE trials per model to pick hyperparameters.
 Folds 2-8 reuse those. Predictions are saved for evaluate.py to consume.
 
-Targets:
-- Regression: forward 21-day return, winsorized per-date at 1st/99th pct
-- Classification: binary drawdown flag (raw, not winsorized)
+Variants:
+- v1:  raw features, 21d return target (baseline)
+- v2a: rank-transformed features, 21d return target
+- v2b: v2a + sector_excess_ret_21d_rank
+- v2c: v2b features, 21d return-rank target
+- v2d: v2a features minus sector one-hots
+- v3a: v2a features, 63d return target (longer horizon)
 
-Key design decisions documented in 03_ROADMAP.md and 04_DECISIONS_AND_LESSONS.md.
+Key design decisions in 03_ROADMAP.md and 04_DECISIONS_AND_LESSONS.md.
 """
 
+import argparse
 import numpy as np
 import pandas as pd
 import optuna
@@ -29,11 +34,10 @@ from sklearn.metrics import roc_auc_score
 from cv import PurgedWalkForwardCV, inner_early_stopping_split
 
 
-# Paths
+# Static paths
 TRAINING_FILE = Path("data/processed/features_training.parquet")
 PREDICTIONS_DIR = Path("data/predictions")
-PREDICTIONS_FILE = PREDICTIONS_DIR / "cv_predictions.parquet"
-MODELS_DIR = Path("results/models")
+MODELS_BASE_DIR = Path("results/models")
 
 # Reproducibility
 RANDOM_SEED = 42
@@ -43,46 +47,122 @@ N_OPTUNA_TRIALS = 30
 EARLY_STOPPING_ROUNDS = 50
 N_ESTIMATORS_MAX = 500
 
-# Target winsorization percentiles
+# Target winsorization percentiles (applied only to variants that use the
+# raw winsorized target; rank-transformed targets are already bounded)
 WINSOR_LOWER_Q = 0.01
 WINSOR_UPPER_Q = 0.99
 
-# Feature columns (25 total). Raw sector string is excluded here — that's
-# for LightGBM later. XGBoost uses the one-hot encoded sector columns.
-NUMERIC_FEATURE_COLS = [
+# Feature column groupings
+V1_NUMERIC_FEATURE_COLS = [
     "ret_21d", "ret_63d", "ret_252d", "price_to_sma50",
     "vol_20d", "range_pct_20d", "max_dd_90d",
     "beta_60d", "excess_ret_21d",
     "rsi_14", "bb_position_20", "macd_hist", "atr_14_pct",
     "volume_ratio_20d",
 ]
+V2_RANK_FEATURE_COLS = [f"{c}_rank" for c in V1_NUMERIC_FEATURE_COLS]
+SECTOR_EXCESS_RANK_COL = "sector_excess_ret_21d_rank"
 SECTOR_ONEHOT_COLS = [
     "sector_communication_services", "sector_consumer_discretionary",
     "sector_consumer_staples", "sector_energy", "sector_financials",
     "sector_health_care", "sector_industrials", "sector_information_technology",
     "sector_materials", "sector_real_estate", "sector_utilities",
 ]
-FEATURE_COLS = NUMERIC_FEATURE_COLS + SECTOR_ONEHOT_COLS
 
-TARGET_RETURN = "target_ret_21d"
+# Target column names
+TARGET_RETURN_RAW = "target_ret_21d"
+TARGET_RETURN_63D = "target_ret_63d"
+TARGET_RETURN_RANK = "target_ret_21d_rank"
 TARGET_DRAWDOWN = "target_dd5_21d"
 
-# Silence Optuna's verbose trial logging. We'll print our own summary.
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-def winsorize_per_date(df, target_col, lower_q=WINSOR_LOWER_Q, upper_q=WINSOR_UPPER_Q):
-    """Winsorize a target column at per-date percentiles.
 
-    For each date, computes the 1st and 99th percentile of the target
-    across all tickers on that date, then clips values outside those
-    bounds to the bounds. This tames the meme-stock outliers (+392% in
-    21 days, etc.) without losing return magnitude the optimizer needs.
-
-    Per-date (not global) because return distributions shift over time —
-    a 10% return is unusual in a calm month but ordinary during COVID.
-
-    Returns a new Series (original column unchanged).
+def get_variant_config(variant):
+    """Return per-variant feature list, target column, winsorize flag,
+    purge_days, and output paths.
     """
+    if variant == "v1":
+        feature_cols = V1_NUMERIC_FEATURE_COLS + SECTOR_ONEHOT_COLS
+        regression_target = TARGET_RETURN_RAW
+        winsorize_target = True
+        purge_days = 21
+
+    elif variant == "v2a":
+        feature_cols = V2_RANK_FEATURE_COLS + SECTOR_ONEHOT_COLS
+        regression_target = TARGET_RETURN_RAW
+        winsorize_target = True
+        purge_days = 21
+
+    elif variant == "v2b":
+        feature_cols = V2_RANK_FEATURE_COLS + [SECTOR_EXCESS_RANK_COL] + SECTOR_ONEHOT_COLS
+        regression_target = TARGET_RETURN_RAW
+        winsorize_target = True
+        purge_days = 21
+
+    elif variant == "v2c":
+        feature_cols = V2_RANK_FEATURE_COLS + [SECTOR_EXCESS_RANK_COL] + SECTOR_ONEHOT_COLS
+        regression_target = TARGET_RETURN_RANK
+        winsorize_target = False
+        purge_days = 21
+
+    elif variant == "v2d":
+        # Sector-neutral: no sector one-hots
+        feature_cols = V2_RANK_FEATURE_COLS + [SECTOR_EXCESS_RANK_COL]
+        regression_target = TARGET_RETURN_RAW
+        winsorize_target = True
+        purge_days = 21
+
+    elif variant == "v3a":
+        # Longer horizon: 63-day forward return target. Same features as v2a.
+        # Purge extended to 63 days to match the target horizon.
+        feature_cols = V2_RANK_FEATURE_COLS + SECTOR_ONEHOT_COLS
+        regression_target = TARGET_RETURN_63D
+        winsorize_target = True
+        purge_days = 63
+
+    elif variant == "v3d":
+        # Sector-neutral at 63-day horizon: v3a features minus sector one-hots,
+        # plus sector_excess_ret_21d_rank to capture within-sector signal.
+        # Tests whether the longer-horizon signal is real factor content or
+        # sector-memorization in disguise.
+        feature_cols = V2_RANK_FEATURE_COLS + [SECTOR_EXCESS_RANK_COL]
+        regression_target = TARGET_RETURN_63D
+        winsorize_target = True
+        purge_days = 63
+
+    else:
+        raise ValueError(
+            f"Unknown variant: {variant!r}. "
+            f"Must be one of v1, v2a, v2b, v2c, v2d, v3a, v3d."
+        )
+
+    return {
+        "variant": variant,
+        "feature_cols": feature_cols,
+        "regression_target": regression_target,
+        "winsorize_target": winsorize_target,
+        "purge_days": purge_days,
+        "predictions_file": PREDICTIONS_DIR / f"cv_predictions_{variant}.parquet",
+        "models_dir": MODELS_BASE_DIR / variant,
+    }
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Stage 3 training for ML Portfolio Optimizer"
+    )
+    parser.add_argument(
+        "--variant",
+        required=True,
+        choices=["v1", "v2a", "v2b", "v2c", "v2d", "v3a", "v3d"],
+        help="Which model variant to train (affects features, target, purge)",
+    )
+    return parser.parse_args()
+
+
+def winsorize_per_date(df, target_col, lower_q=WINSOR_LOWER_Q, upper_q=WINSOR_UPPER_Q):
+    """Winsorize a target column at per-date percentiles."""
     def clip_group(group):
         lower = group.quantile(lower_q)
         upper = group.quantile(upper_q)
@@ -91,36 +171,37 @@ def winsorize_per_date(df, target_col, lower_q=WINSOR_LOWER_Q, upper_q=WINSOR_UP
     return df.groupby("date")[target_col].transform(clip_group)
 
 
-def load_and_prep():
-    """Load training parquet and prepare targets.
-
-    Returns the DataFrame with an added 'target_ret_21d_winsor' column
-    (winsorized regression target). Original columns are preserved so
-    evaluation can compare against raw actuals.
-    """
+def load_and_prep(config):
+    """Load training parquet and prepare the regression target per variant."""
     print(f"Loading {TRAINING_FILE}...")
     df = pd.read_parquet(TRAINING_FILE)
     print(f"  {len(df):,} rows, date range {df['date'].min().date()} to {df['date'].max().date()}")
 
-    print(f"Winsorizing {TARGET_RETURN} at per-date [{WINSOR_LOWER_Q:.0%}, {WINSOR_UPPER_Q:.0%}]...")
-    df["target_ret_21d_winsor"] = winsorize_per_date(df, TARGET_RETURN)
+    target_col = config["regression_target"]
 
-    raw_std = df[TARGET_RETURN].std()
-    winsor_std = df["target_ret_21d_winsor"].std()
-    raw_max = df[TARGET_RETURN].max()
-    winsor_max = df["target_ret_21d_winsor"].max()
-    print(f"  Raw target:      std={raw_std:.3f}, max={raw_max:.3f}")
-    print(f"  Winsorized:      std={winsor_std:.3f}, max={winsor_max:.3f}")
+    if config["winsorize_target"]:
+        print(f"Winsorizing {target_col} at per-date [{WINSOR_LOWER_Q:.0%}, {WINSOR_UPPER_Q:.0%}]...")
+        df["regression_target_used"] = winsorize_per_date(df, target_col)
+
+        raw_std = df[target_col].std()
+        used_std = df["regression_target_used"].std()
+        raw_max = df[target_col].max()
+        used_max = df["regression_target_used"].max()
+        print(f"  Raw target:      std={raw_std:.3f}, max={raw_max:.3f}")
+        print(f"  Winsorized:      std={used_std:.3f}, max={used_max:.3f}")
+    else:
+        print(f"Using {target_col} as regression target (no winsorization — already bounded)")
+        df["regression_target_used"] = df[target_col]
+        used_std = df["regression_target_used"].std()
+        used_min = df["regression_target_used"].min()
+        used_max = df["regression_target_used"].max()
+        print(f"  Target stats:    std={used_std:.3f}, min={used_min:.3f}, max={used_max:.3f}")
 
     return df
 
-def _suggest_xgb_params(trial, task):
-    """Sample XGBoost hyperparameters from the Optuna trial.
 
-    `task` is either 'regression' or 'classification'. Search space is
-    essentially identical — XGBoost's core hyperparameters aren't
-    task-specific. We branch only on the objective function.
-    """
+def _suggest_xgb_params(trial, task):
+    """Sample XGBoost hyperparameters from the Optuna trial."""
     params = {
         "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
         "max_depth": trial.suggest_int("max_depth", 3, 8),
@@ -149,18 +230,7 @@ def _suggest_xgb_params(trial, task):
 
 
 def _spearman_ic(y_true, y_pred, dates):
-    """Cross-sectional Spearman IC averaged across dates.
-
-    For each date, compute Spearman rank correlation between predictions
-    and actuals across that day's tickers. Return the mean of those
-    per-date correlations.
-
-    Degenerate dates (fewer than 2 names, or constant predictions/actuals
-    producing NaN from scipy) contribute 0.0, not NaN. This reflects the
-    fact that a constant-prediction day has zero rank information —
-    correctly counted as "no signal" rather than silently dropped, which
-    would bias the average upward.
-    """
+    """Cross-sectional Spearman IC averaged across dates."""
     def daily_corr(group):
         if len(group) < 2:
             return 0.0
@@ -172,37 +242,19 @@ def _spearman_ic(y_true, y_pred, dates):
     return daily_ic.mean()
 
 
-def make_objective(df, train_idx, task):
-    """Factory: returns an Optuna objective function for the given task.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Full training DataFrame (with winsorized target).
-    train_idx : np.ndarray
-        Fold 1's outer training indices from PurgedWalkForwardCV.
-    task : str
-        'regression' or 'classification'.
-
-    Returns
-    -------
-    objective : callable
-        Function that takes an optuna Trial and returns a float score.
-        Higher is better (IC for regression, AUC for classification).
-    """
-    # Split fold 1's training into inner-train and inner-val ONCE here,
-    # so every Optuna trial evaluates on the same inner-val.
+def make_objective(df, train_idx, task, feature_cols):
+    """Factory: returns an Optuna objective function for the given task."""
     inner_train_idx, inner_val_idx = inner_early_stopping_split(
         df, train_idx, inner_val_frac=0.1
     )
 
-    X_inner_train = df.iloc[inner_train_idx][FEATURE_COLS]
-    X_inner_val = df.iloc[inner_val_idx][FEATURE_COLS]
+    X_inner_train = df.iloc[inner_train_idx][feature_cols]
+    X_inner_val = df.iloc[inner_val_idx][feature_cols]
     inner_val_dates = df.iloc[inner_val_idx]["date"].values
 
     if task == "regression":
-        y_inner_train = df.iloc[inner_train_idx]["target_ret_21d_winsor"]
-        y_inner_val = df.iloc[inner_val_idx]["target_ret_21d_winsor"]
+        y_inner_train = df.iloc[inner_train_idx]["regression_target_used"]
+        y_inner_val = df.iloc[inner_val_idx]["regression_target_used"]
     else:
         y_inner_train = df.iloc[inner_train_idx][TARGET_DRAWDOWN]
         y_inner_val = df.iloc[inner_val_idx][TARGET_DRAWDOWN]
@@ -226,26 +278,15 @@ def make_objective(df, train_idx, task):
             return _spearman_ic(y_inner_val.values, preds, inner_val_dates)
         else:
             preds = model.predict_proba(X_inner_val)[:, 1]
-            # Guard against single-class inner-val (rare but possible for
-            # a contiguous 10% block during quiet markets). AUC is
-            # undefined in that case; fall back to 0.5 (no-skill baseline)
-            # rather than crashing the trial.
             if len(np.unique(y_inner_val)) < 2:
                 return 0.5
             return roc_auc_score(y_inner_val, preds)
 
     return objective
 
-def tune_hyperparameters(df, train_idx):
-    """Run Optuna on fold 1 to pick hyperparameters for both models.
 
-    Returns a dict with two sub-dicts: 'regression' and 'classification',
-    each containing the best hyperparameters found by Optuna.
-
-    Folds 2-8 reuse these hyperparameters — we don't re-tune per fold
-    because that overfits hyperparameters to each fold's noise (standard
-    simplification for walk-forward setups).
-    """
+def tune_hyperparameters(df, train_idx, feature_cols):
+    """Run Optuna on fold 1 to pick hyperparameters for both models."""
     print(f"\n{'='*60}")
     print(f"Tuning hyperparameters on fold 1 with {N_OPTUNA_TRIALS} trials per model")
     print(f"{'='*60}")
@@ -254,7 +295,7 @@ def tune_hyperparameters(df, train_idx):
 
     for task in ["regression", "classification"]:
         print(f"\n  Tuning {task} model...")
-        objective = make_objective(df, train_idx, task)
+        objective = make_objective(df, train_idx, task, feature_cols)
 
         study = optuna.create_study(
             direction="maximize",
@@ -269,42 +310,39 @@ def tune_hyperparameters(df, train_idx):
 
     return results
 
-def train_fold(df, train_idx, val_idx, hyperparams, fold_num):
-    """Train both models on one fold and predict on the outer validation set.
 
-    For each model (regression, classification):
-    1. Split this fold's training data into inner-train + inner-val (last
-       10% by date) for XGBoost early stopping.
-    2. Fit the model on inner-train with early stopping on inner-val.
-    3. Sanity-check that best_iteration was populated (early stopping bug
-       check flagged during research).
-    4. Predict on the outer val set.
-    5. Save the trained model to disk.
+def train_fold(df, train_idx, val_idx, hyperparams, fold_num, config):
+    """Train both models on one fold and predict on the outer validation set."""
+    models_dir = config["models_dir"]
+    models_dir.mkdir(parents=True, exist_ok=True)
 
-    Returns a DataFrame with one row per outer-val sample containing:
-    ticker, date, target actuals, predictions, and fold number.
-    """
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    feature_cols = config["feature_cols"]
 
     inner_train_idx, inner_val_idx = inner_early_stopping_split(
         df, train_idx, inner_val_frac=0.1
     )
 
-    X_inner_train = df.iloc[inner_train_idx][FEATURE_COLS]
-    X_inner_val = df.iloc[inner_val_idx][FEATURE_COLS]
-    X_outer_val = df.iloc[val_idx][FEATURE_COLS]
+    X_inner_train = df.iloc[inner_train_idx][feature_cols]
+    X_inner_val = df.iloc[inner_val_idx][feature_cols]
+    X_outer_val = df.iloc[val_idx][feature_cols]
 
-    # Prep the output predictions DataFrame
-    predictions = df.iloc[val_idx][["ticker", "date", TARGET_RETURN, TARGET_DRAWDOWN]].copy()
+    # Predictions store BOTH 21-day and 63-day raw returns as actuals.
+    # evaluate.py picks the right column per variant (21d-horizon variants
+    # score against actual_return_21d, v3a scores against actual_return_63d).
+    # Storing both lets compare mode evaluate every variant on its own horizon.
+    predictions = df.iloc[val_idx][
+        ["ticker", "date", TARGET_RETURN_RAW, TARGET_RETURN_63D, TARGET_DRAWDOWN]
+    ].copy()
     predictions = predictions.rename(columns={
-        TARGET_RETURN: "actual_return",
+        TARGET_RETURN_RAW: "actual_return_21d",
+        TARGET_RETURN_63D: "actual_return_63d",
         TARGET_DRAWDOWN: "actual_drawdown",
     })
     predictions["fold"] = fold_num
 
     # --- Regression: predict return ---
-    y_inner_train_reg = df.iloc[inner_train_idx]["target_ret_21d_winsor"]
-    y_inner_val_reg = df.iloc[inner_val_idx]["target_ret_21d_winsor"]
+    y_inner_train_reg = df.iloc[inner_train_idx]["regression_target_used"]
+    y_inner_val_reg = df.iloc[inner_val_idx]["regression_target_used"]
 
     reg_params = {
         **hyperparams["regression"],
@@ -326,7 +364,7 @@ def train_fold(df, train_idx, val_idx, hyperparams, fold_num):
         "Regression model best_iteration not populated — early stopping may not be working"
 
     predictions["pred_return"] = reg_model.predict(X_outer_val)
-    reg_model.save_model(str(MODELS_DIR / f"fold_{fold_num}_regression.json"))
+    reg_model.save_model(str(models_dir / f"fold_{fold_num}_regression.json"))
 
     # --- Classification: predict drawdown probability ---
     y_inner_train_clf = df.iloc[inner_train_idx][TARGET_DRAWDOWN]
@@ -352,7 +390,7 @@ def train_fold(df, train_idx, val_idx, hyperparams, fold_num):
         "Classifier best_iteration not populated — early stopping may not be working"
 
     predictions["pred_drawdown_prob"] = clf_model.predict_proba(X_outer_val)[:, 1]
-    clf_model.save_model(str(MODELS_DIR / f"fold_{fold_num}_classification.json"))
+    clf_model.save_model(str(models_dir / f"fold_{fold_num}_classification.json"))
 
     print(f"  Fold {fold_num}: reg best_iter={reg_model.best_iteration}, "
           f"clf best_iter={clf_model.best_iteration}, "
@@ -360,53 +398,63 @@ def train_fold(df, train_idx, val_idx, hyperparams, fold_num):
 
     return predictions
 
-def main():
-    """Orchestrate the full training pipeline.
 
-    1. Load and prepare training data (winsorize regression target)
-    2. Initialize the purged walk-forward CV splitter
-    3. Tune hyperparameters on fold 1 only (Optuna, 2 studies)
-    4. Train both models on each of the 8 folds, predicting on outer val
-    5. Concatenate all fold predictions and save to parquet
-    """
+def main():
+    """Orchestrate the full training pipeline for the selected variant."""
+    args = parse_args()
+    config = get_variant_config(args.variant)
+
+    print(f"{'='*60}")
+    print(f"TRAINING VARIANT: {config['variant']}")
+    print(f"  Features:         {len(config['feature_cols'])}")
+    print(f"  Regression target: {config['regression_target']}")
+    print(f"  Winsorize target: {config['winsorize_target']}")
+    print(f"  Purge days:       {config['purge_days']}")
+    print(f"  Output file:      {config['predictions_file']}")
+    print(f"  Models dir:       {config['models_dir']}")
+    print(f"{'='*60}\n")
+
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
 
-    df = load_and_prep()
-    df = df.reset_index(drop=True)  # guarantee positional index 0..N-1
+    df = load_and_prep(config)
+    df = df.reset_index(drop=True)
 
-    cv = PurgedWalkForwardCV(start_year=2015, end_year=2022, purge_days=21)
-    print(f"\nWalk-forward CV: {cv.get_n_splits()} folds from {cv.start_year} to {cv.end_year}\n")
+    cv = PurgedWalkForwardCV(
+        start_year=2015, end_year=2022, purge_days=config["purge_days"]
+    )
+    print(f"\nWalk-forward CV: {cv.get_n_splits()} folds from {cv.start_year} to {cv.end_year} "
+          f"(purge={config['purge_days']} days)\n")
 
-    # Fold 1 is special — tune hyperparameters on it
     first_fold_generator = cv.split(df)
     train_idx_f1, val_idx_f1 = next(first_fold_generator)
-    hyperparams = tune_hyperparameters(df, train_idx_f1)
+    hyperparams = tune_hyperparameters(df, train_idx_f1, config["feature_cols"])
 
-    # Now train all 8 folds using the tuned hyperparameters
     print(f"\n{'='*60}")
     print(f"Training all {cv.get_n_splits()} folds with tuned hyperparameters")
     print(f"{'='*60}")
 
     all_predictions = []
 
-    # Fold 1 uses the indices we already have
-    all_predictions.append(train_fold(df, train_idx_f1, val_idx_f1, hyperparams, fold_num=1))
+    all_predictions.append(
+        train_fold(df, train_idx_f1, val_idx_f1, hyperparams, fold_num=1, config=config)
+    )
 
-    # Folds 2-8 come from the generator
     for fold_num, (train_idx, val_idx) in enumerate(cv.split(df), start=1):
         if fold_num == 1:
-            continue  # already handled
-        all_predictions.append(train_fold(df, train_idx, val_idx, hyperparams, fold_num=fold_num))
+            continue
+        all_predictions.append(
+            train_fold(df, train_idx, val_idx, hyperparams, fold_num=fold_num, config=config)
+        )
 
     predictions = pd.concat(all_predictions, ignore_index=True)
-    predictions.to_parquet(PREDICTIONS_FILE)
+    predictions.to_parquet(config["predictions_file"])
 
     print(f"\n{'='*60}")
-    print(f"Done. Predictions saved to {PREDICTIONS_FILE}")
+    print(f"Done. Predictions saved to {config['predictions_file']}")
     print(f"  Rows: {len(predictions):,}")
     print(f"  Folds: {predictions['fold'].nunique()}")
     print(f"  Date range: {predictions['date'].min().date()} to {predictions['date'].max().date()}")
-    print(f"  Models saved to {MODELS_DIR}/")
+    print(f"  Models saved to {config['models_dir']}/")
     print(f"{'='*60}")
 
 

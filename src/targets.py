@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 
 FORWARD_WINDOW = 21
+FORWARD_WINDOW_63 = 63
 DRAWDOWN_THRESHOLD = 0.05
 
 
@@ -9,7 +10,7 @@ def add_target_ret_21d(panel):
     """Add target_ret_21d: forward 21-trading-day return.
 
     Value at date T is the return earned from T to T+21. This is the
-    regression target — what the ML model will try to predict.
+    regression target for v1/v2 variants — what the ML model tries to predict.
 
     NOTE: uses shift(-21), which looks FORWARD. Only appropriate for
     targets, never for features.
@@ -21,12 +22,34 @@ def add_target_ret_21d(panel):
     return panel
 
 
+def add_target_ret_63d(panel):
+    """Add target_ret_63d: forward 63-trading-day return.
+
+    Value at date T is the return earned from T to T+63 (~3 months).
+    Used as the regression target for v3 variants. Longer horizon averages
+    out more idiosyncratic noise than the 21-day target, potentially
+    revealing stronger cross-sectional signal.
+
+    NOTE: uses shift(-63), which looks FORWARD. Only appropriate for
+    targets, never for features.
+    """
+    panel["target_ret_63d"] = (
+        panel.groupby("ticker")["adj_close"]
+        .transform(lambda x: x.shift(-FORWARD_WINDOW_63) / x - 1)
+    )
+    return panel
+
+
 def add_target_dd5_21d(panel):
     """Add target_dd5_21d: binary flag for >5% drawdown in next 21 days.
 
     Value at date T is 1 if the adj_close at any point in [T+1, T+21]
     drops more than 5% below adj_close at T, else 0. NaN where the
     forward window is incomplete (last 21 rows per ticker).
+
+    Kept at 21 days regardless of regression horizon — the classifier's
+    role is near-term risk for the monthly-rebalance optimizer, not
+    aligned with the regression target.
 
     NOTE: looks FORWARD. Only appropriate for targets, never for features.
     """
@@ -57,12 +80,11 @@ def add_target_ret_21d_rank(panel):
 
     This is the same metric our evaluation uses (Spearman rank IC), directly
     baked into a training target. Training against this aligns the loss
-    function (MSE) with the evaluation metric (rank correlation) — addresses
-    the loss/metric mismatch ChatGPT flagged in v1.
+    function (MSE) with the evaluation metric (rank correlation).
 
-    Ranks are normalized to [0, 1] via method='average' with pct=True,
-    matching the rank transform used for features. NaN inputs stay NaN
-    (last 21 rows per ticker, where forward returns can't be computed).
+    Ranks are normalized to (0, 1] via method='average' with pct=True
+    (equivalent to rank/N, where N is the non-NaN count on that date).
+    NaN inputs stay NaN (last 21 rows per ticker).
 
     Requires target_ret_21d to already exist. Call AFTER add_target_ret_21d.
     """

@@ -1,18 +1,38 @@
 """Stage 3 evaluation: assess CV predictions from train.py.
 
-Reads out-of-fold predictions and produces:
-1. Regression diagnostics — per-date and pooled Spearman IC, ICIR
-2. Classification diagnostics — AUC, Brier score, calibration plot
-3. Feature importance — per-fold and aggregated, saved as PNG charts
-4. Go/no-go recommendation for Stage 4
+Two modes:
 
-Inputs: data/predictions/cv_predictions.parquet (from train.py)
-        results/models/fold_{N}_{type}.json (from train.py)
+1. Single-variant mode — evaluate one variant end-to-end:
+   python src/evaluate.py --variant v2b
 
-Outputs: results/evaluation_summary.csv
-         results/calibration_plot.png
-         results/feature_importance_regression.png
-         results/feature_importance_classification.png
+   Produces per-variant charts and detailed per-fold breakdown.
+
+2. Compare mode — compare all available variants side-by-side:
+   python src/evaluate.py --compare
+
+   Prints a comparison table and saves a per-fold IC chart showing
+   all variants as lines.
+
+Each variant is evaluated on its own target horizon (21-day for v1/v2*,
+63-day for v3*). Spearman IC is rank-based, so even though v3a's
+pred_return is in return-magnitude space and gets compared to raw 63-day
+returns, the IC calculation re-ranks both inputs per date and produces
+a meaningful cross-sectional ranking skill metric on v3a's own horizon.
+
+Inputs (per variant):
+  data/predictions/cv_predictions_{variant}.parquet  (contains both
+    actual_return_21d and actual_return_63d columns)
+  results/models/{variant}/fold_{N}_{type}.json
+
+Outputs:
+  Single-variant mode:
+    results/evaluation_summary_{variant}.csv
+    results/calibration_plot_{variant}.png
+    results/feature_importance_regression_{variant}.png
+    results/feature_importance_classification_{variant}.png
+  Compare mode:
+    results/variant_comparison.csv
+    results/variant_comparison_ic.png
 
 Go/no-go thresholds (research-validated against equity quant literature):
   Green  (proceed):  IC >= 0.03 AND ICIR >= 0.40
@@ -20,6 +40,7 @@ Go/no-go thresholds (research-validated against equity quant literature):
   Red    (rework):   below yellow
 """
 
+import argparse
 import numpy as np
 import pandas as pd
 import xgboost as xgb
@@ -30,13 +51,11 @@ from sklearn.metrics import roc_auc_score, brier_score_loss
 from sklearn.calibration import calibration_curve
 
 
-PREDICTIONS_FILE = Path("data/predictions/cv_predictions.parquet")
-MODELS_DIR = Path("results/models")
+PREDICTIONS_DIR = Path("data/predictions")
+MODELS_BASE_DIR = Path("results/models")
 RESULTS_DIR = Path("results")
-SUMMARY_FILE = RESULTS_DIR / "evaluation_summary.csv"
-CALIBRATION_PLOT = RESULTS_DIR / "calibration_plot.png"
-FI_REG_PLOT = RESULTS_DIR / "feature_importance_regression.png"
-FI_CLF_PLOT = RESULTS_DIR / "feature_importance_classification.png"
+
+ALL_VARIANTS = ["v1", "v2a", "v2b", "v2c", "v2d", "v3a", "v3d"]
 
 # Go/no-go thresholds
 IC_GREEN = 0.03
@@ -44,77 +63,166 @@ IC_YELLOW = 0.01
 ICIR_GREEN = 0.40
 ICIR_YELLOW = 0.20
 
-# Feature columns — must match train.py's FEATURE_COLS order so that
-# XGBoost's feature_importances_ array lines up correctly.
-NUMERIC_FEATURE_COLS = [
+# Feature column definitions per variant (must match train.py at fit time).
+V1_NUMERIC_FEATURE_COLS = [
     "ret_21d", "ret_63d", "ret_252d", "price_to_sma50",
     "vol_20d", "range_pct_20d", "max_dd_90d",
     "beta_60d", "excess_ret_21d",
     "rsi_14", "bb_position_20", "macd_hist", "atr_14_pct",
     "volume_ratio_20d",
 ]
+V2_RANK_FEATURE_COLS = [f"{c}_rank" for c in V1_NUMERIC_FEATURE_COLS]
+SECTOR_EXCESS_RANK_COL = "sector_excess_ret_21d_rank"
 SECTOR_ONEHOT_COLS = [
     "sector_communication_services", "sector_consumer_discretionary",
     "sector_consumer_staples", "sector_energy", "sector_financials",
     "sector_health_care", "sector_industrials", "sector_information_technology",
     "sector_materials", "sector_real_estate", "sector_utilities",
 ]
-FEATURE_COLS = NUMERIC_FEATURE_COLS + SECTOR_ONEHOT_COLS
 
 
-def load_predictions():
-    """Load the CV predictions parquet produced by train.py."""
-    print(f"Loading {PREDICTIONS_FILE}...")
-    df = pd.read_parquet(PREDICTIONS_FILE)
+def get_variant_config(variant):
+    """Return per-variant paths, feature list, evaluation target, and metadata.
+
+    actual_return_col: which column in the predictions file to use as the
+    ground truth. 21d-horizon variants use actual_return_21d; v3a uses
+    actual_return_63d.
+    """
+    if variant == "v1":
+        feature_cols = V1_NUMERIC_FEATURE_COLS + SECTOR_ONEHOT_COLS
+        stage4_ready = "yes"
+        notes = "baseline"
+        horizon = "21d"
+        actual_return_col = "actual_return_21d"
+    elif variant == "v2a":
+        feature_cols = V2_RANK_FEATURE_COLS + SECTOR_ONEHOT_COLS
+        stage4_ready = "yes"
+        notes = "rank features"
+        horizon = "21d"
+        actual_return_col = "actual_return_21d"
+    elif variant == "v2b":
+        feature_cols = V2_RANK_FEATURE_COLS + [SECTOR_EXCESS_RANK_COL] + SECTOR_ONEHOT_COLS
+        stage4_ready = "yes"
+        notes = "rank + sector-excess"
+        horizon = "21d"
+        actual_return_col = "actual_return_21d"
+    elif variant == "v2c":
+        feature_cols = V2_RANK_FEATURE_COLS + [SECTOR_EXCESS_RANK_COL] + SECTOR_ONEHOT_COLS
+        stage4_ready = "partial"
+        notes = "rank target; mu-hat needs mapping for Stage 4"
+        horizon = "21d"
+        actual_return_col = "actual_return_21d"
+    elif variant == "v2d":
+        feature_cols = V2_RANK_FEATURE_COLS + [SECTOR_EXCESS_RANK_COL]
+        stage4_ready = "yes"
+        notes = "sector-neutral (no sector one-hots)"
+        horizon = "21d"
+        actual_return_col = "actual_return_21d"
+    elif variant == "v3a":
+        feature_cols = V2_RANK_FEATURE_COLS + SECTOR_ONEHOT_COLS
+        stage4_ready = "yes"
+        notes = "63-day horizon (v2a features)"
+        horizon = "63d"
+        actual_return_col = "actual_return_63d"
+    elif variant == "v3d":
+        feature_cols = V2_RANK_FEATURE_COLS + [SECTOR_EXCESS_RANK_COL]
+        stage4_ready = "yes"
+        notes = "63-day sector-neutral"
+        horizon = "63d"
+        actual_return_col = "actual_return_63d"
+    else:
+        raise ValueError(f"Unknown variant: {variant!r}")
+
+    return {
+        "variant": variant,
+        "feature_cols": feature_cols,
+        "stage4_ready": stage4_ready,
+        "notes": notes,
+        "horizon": horizon,
+        "actual_return_col": actual_return_col,
+        "predictions_file": PREDICTIONS_DIR / f"cv_predictions_{variant}.parquet",
+        "models_dir": MODELS_BASE_DIR / variant,
+        "summary_csv": RESULTS_DIR / f"evaluation_summary_{variant}.csv",
+        "calibration_plot": RESULTS_DIR / f"calibration_plot_{variant}.png",
+        "fi_reg_plot": RESULTS_DIR / f"feature_importance_regression_{variant}.png",
+        "fi_clf_plot": RESULTS_DIR / f"feature_importance_classification_{variant}.png",
+    }
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Stage 3 evaluation for ML Portfolio Optimizer"
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--variant",
+        choices=ALL_VARIANTS,
+        help="Evaluate a single variant end-to-end with per-variant charts",
+    )
+    group.add_argument(
+        "--compare",
+        action="store_true",
+        help="Compare all detected variants side-by-side with a summary table",
+    )
+    return parser.parse_args()
+
+
+def load_predictions(config):
+    """Load a variant's CV predictions parquet and validate it has the
+    expected actual-return column for this variant's evaluation horizon."""
+    print(f"Loading {config['predictions_file']}...")
+    df = pd.read_parquet(config["predictions_file"])
     print(f"  {len(df):,} rows across {df['fold'].nunique()} folds")
     print(f"  Date range: {df['date'].min().date()} to {df['date'].max().date()}")
+
+    required_col = config["actual_return_col"]
+    if required_col not in df.columns:
+        raise ValueError(
+            f"Predictions file for {config['variant']} is missing column "
+            f"'{required_col}' (needed for {config['horizon']} horizon evaluation). "
+            f"Re-run train.py --variant {config['variant']} to regenerate with "
+            f"both actual_return_21d and actual_return_63d columns."
+        )
+
     return df
 
 
-def per_date_ic(df):
+# ---- Regression metrics ----
+
+def per_date_ic(df, actual_col):
     """Compute Spearman rank correlation between predictions and actual
     returns for each date separately.
 
-    Returns a Series indexed by date with one IC per date.
+    Returns a Series indexed by date with one IC per date. Degenerate
+    dates (fewer than 2 tickers, or NaN spearman output) contribute 0.0.
 
-    Degenerate dates (fewer than 2 tickers, or constant predictions/actuals
-    producing NaN) contribute 0.0, consistent with train.py's IC metric.
+    actual_col: name of the actuals column ('actual_return_21d' or
+    'actual_return_63d' depending on variant horizon).
     """
     def daily_corr(group):
         if len(group) < 2:
             return 0.0
-        corr = spearmanr(group["actual_return"], group["pred_return"]).correlation
+        corr = spearmanr(group[actual_col], group["pred_return"]).correlation
         return 0.0 if np.isnan(corr) else corr
 
     return df.groupby("date").apply(daily_corr, include_groups=False)
 
 
-def regression_metrics(df):
-    """Compute IC, ICIR, and per-fold IC breakdown.
-
-    Returns
-    -------
-    summary : dict
-        Overall metrics: mean_ic_pooled, icir_pooled, mean_ic_per_fold
-    per_fold : pd.DataFrame
-        One row per fold with mean_ic, ic_std, icir, n_dates, n_obs
-    """
-    # Pooled: one IC per date across ALL folds (each date in exactly 1 fold
-    # since walk-forward creates non-overlapping validation periods)
-    pooled_ic = per_date_ic(df)
+def regression_metrics(df, actual_col):
+    """Compute pooled and per-fold IC / ICIR."""
+    pooled_ic = per_date_ic(df, actual_col)
     mean_ic_pooled = pooled_ic.mean()
     std_ic_pooled = pooled_ic.std()
     icir_pooled = mean_ic_pooled / std_ic_pooled if std_ic_pooled > 0 else np.nan
 
-    # Per-fold breakdown
     per_fold_rows = []
     for fold_num, fold_df in df.groupby("fold"):
-        fold_ic = per_date_ic(fold_df)
+        fold_ic = per_date_ic(fold_df, actual_col)
         mean_ic = fold_ic.mean()
         ic_std = fold_ic.std()
         icir = mean_ic / ic_std if ic_std > 0 else np.nan
         per_fold_rows.append({
-            "fold": fold_num,
+            "fold": int(fold_num),
             "mean_ic": mean_ic,
             "ic_std": ic_std,
             "icir": icir,
@@ -127,23 +235,25 @@ def regression_metrics(df):
         "mean_ic_pooled": mean_ic_pooled,
         "std_ic_pooled": std_ic_pooled,
         "icir_pooled": icir_pooled,
+        "worst_fold_ic": per_fold["mean_ic"].min(),
+        "best_fold_ic": per_fold["mean_ic"].max(),
         "mean_ic_per_fold_avg": per_fold["mean_ic"].mean(),
         "icir_per_fold_avg": per_fold["icir"].mean(),
     }
-
     return summary, per_fold
 
 
-def print_regression_report(summary, per_fold):
-    """Print a human-readable regression summary."""
+def print_regression_report(summary, per_fold, horizon):
     print("\n" + "=" * 60)
-    print("REGRESSION METRICS (forward 21-day return prediction)")
+    print(f"REGRESSION METRICS (forward {horizon} return prediction)")
     print("=" * 60)
 
     print(f"\nPooled across all folds ({len(per_fold)} folds):")
     print(f"  Mean IC:           {summary['mean_ic_pooled']:+.4f}")
     print(f"  Std of daily IC:   {summary['std_ic_pooled']:.4f}")
     print(f"  ICIR:              {summary['icir_pooled']:+.3f}")
+    print(f"  Worst fold IC:     {summary['worst_fold_ic']:+.4f}")
+    print(f"  Best fold IC:      {summary['best_fold_ic']:+.4f}")
 
     print(f"\nPer-fold breakdown:")
     print(f"  {'Fold':<5} {'Mean IC':>10} {'IC Std':>8} {'ICIR':>8} {'N Dates':>8} {'N Obs':>8}")
@@ -159,35 +269,20 @@ def print_regression_report(summary, per_fold):
     print(f"  Average of per-fold ICIR:     {summary['icir_per_fold_avg']:+.3f}")
 
 
+# ---- Classification metrics ----
+
 def classification_metrics(df):
-    """Compute AUC and Brier score, both pooled and per-fold.
-
-    AUC measures discrimination (can the model rank drawdowns vs non-drawdowns).
-    Brier score measures calibration + discrimination combined (MSE on
-    probabilities). Lower Brier is better; 0.25 is the no-skill baseline
-    for a balanced dataset.
-
-    Returns
-    -------
-    summary : dict
-        Overall metrics: auc_pooled, brier_pooled
-    per_fold : pd.DataFrame
-        One row per fold with auc, brier, n_obs, pos_rate
-    """
-    # Defensive guard: evaluate.py expects clean binary labels. If NaNs are
-    # present, the input file is the wrong one (e.g. features_prediction.parquet
-    # instead of cv_predictions.parquet) and metrics would be silently wrong.
+    """Compute pooled and per-fold AUC / Brier. Classifier target is always
+    21-day drawdown regardless of regression variant horizon."""
     if df["actual_drawdown"].isna().any():
         n_nan = df["actual_drawdown"].isna().sum()
         raise ValueError(
             f"actual_drawdown has {n_nan} NaN values. evaluate.py should only "
-            f"be run on the CV predictions file (data/predictions/cv_predictions.parquet), "
-            f"not the prediction set which contains tail rows with unknown labels."
+            f"be run on CV predictions files, not the prediction set which "
+            f"contains tail rows with unknown labels."
         )
 
     summary = {}
-
-    # Pooled AUC/Brier across all 8 folds
     y_true_all = df["actual_drawdown"].values
     y_prob_all = df["pred_drawdown_prob"].values
 
@@ -199,7 +294,6 @@ def classification_metrics(df):
     summary["brier_pooled"] = brier_score_loss(y_true_all, y_prob_all)
     summary["positive_rate_pooled"] = y_true_all.mean()
 
-    # Per-fold breakdown
     per_fold_rows = []
     for fold_num, fold_df in df.groupby("fold"):
         y_true = fold_df["actual_drawdown"].values
@@ -211,50 +305,17 @@ def classification_metrics(df):
             auc = np.nan
 
         per_fold_rows.append({
-            "fold": fold_num,
+            "fold": int(fold_num),
             "auc": auc,
             "brier": brier_score_loss(y_true, y_prob),
             "pos_rate": y_true.mean(),
             "n_obs": len(fold_df),
         })
     per_fold = pd.DataFrame(per_fold_rows)
-
     return summary, per_fold
 
 
-def plot_calibration(df, output_path):
-    """Save a calibration plot (reliability diagram) as PNG.
-
-    Bins predicted probabilities into deciles (10 quantile-based bins),
-    plots mean predicted probability vs actual positive rate per bin.
-    Perfect calibration is the diagonal y=x line.
-    """
-    y_true = df["actual_drawdown"].values
-    y_prob = df["pred_drawdown_prob"].values
-
-    prob_true, prob_pred = calibration_curve(
-        y_true, y_prob, n_bins=10, strategy="quantile"
-    )
-
-    fig, ax = plt.subplots(figsize=(7, 7))
-    ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Perfect calibration")
-    ax.plot(prob_pred, prob_true, marker="o", linewidth=2, label="Model")
-    ax.set_xlabel("Mean predicted probability")
-    ax.set_ylabel("Actual positive rate")
-    ax.set_title("Drawdown classifier calibration (10 quantile bins)")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.legend(loc="upper left")
-    ax.grid(alpha=0.3)
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Calibration plot saved to {output_path}")
-
-
 def print_classification_report(summary, per_fold):
-    """Print a human-readable classification summary."""
     print("\n" + "=" * 60)
     print("CLASSIFICATION METRICS (>5% drawdown in next 21 days)")
     print("=" * 60)
@@ -274,21 +335,41 @@ def print_classification_report(summary, per_fold):
               f"{int(row['n_obs']):>8,}")
 
 
-def compute_feature_importance(task):
-    """Load all 8 fold models of a given task and extract feature importances.
+# ---- Calibration ----
 
-    Returns a DataFrame with one row per feature and columns for each fold's
-    gain-based importance, plus a 'mean' column averaging across folds.
+def plot_calibration(df, output_path):
+    y_true = df["actual_drawdown"].values
+    y_prob = df["pred_drawdown_prob"].values
 
-    Handles both key conventions XGBoost may return from get_score():
-    - Named columns ("ret_21d", "sector_energy") if trained with pandas DataFrames
-    - Positional names ("f0", "f5") if trained with numpy arrays
-    """
+    prob_true, prob_pred = calibration_curve(
+        y_true, y_prob, n_bins=10, strategy="quantile"
+    )
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Perfect calibration")
+    ax.plot(prob_pred, prob_true, marker="o", linewidth=2, label="Model")
+    ax.set_xlabel("Mean predicted probability")
+    ax.set_ylabel("Actual positive rate")
+    ax.set_title("Drawdown classifier calibration (10 quantile bins)")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.legend(loc="upper left")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Calibration plot saved to {output_path}")
+
+
+# ---- Feature importance ----
+
+def compute_feature_importance(models_dir, feature_cols, task):
+    """Load all 8 fold models of a given task and extract feature importances."""
     importances_by_fold = {}
-    feature_to_idx = {name: i for i, name in enumerate(FEATURE_COLS)}
+    feature_to_idx = {name: i for i, name in enumerate(feature_cols)}
 
     for fold_num in range(1, 9):
-        model_path = MODELS_DIR / f"fold_{fold_num}_{task}.json"
+        model_path = models_dir / f"fold_{fold_num}_{task}.json"
 
         if task == "regression":
             model = xgb.XGBRegressor()
@@ -296,45 +377,38 @@ def compute_feature_importance(task):
             model = xgb.XGBClassifier()
         model.load_model(str(model_path))
 
-        # Request gain-based importance. Features not used in any split are
-        # omitted from the returned dict entirely.
         booster = model.get_booster()
         gain_dict = booster.get_score(importance_type="gain")
 
-        gains = np.zeros(len(FEATURE_COLS))
+        gains = np.zeros(len(feature_cols))
         for key, val in gain_dict.items():
             if key in feature_to_idx:
-                # Named column case (pandas-trained)
                 gains[feature_to_idx[key]] = val
             elif key.startswith("f") and key[1:].isdigit():
-                # Positional fallback ("f0", "f5", etc.)
                 idx = int(key[1:])
-                if 0 <= idx < len(FEATURE_COLS):
+                if 0 <= idx < len(feature_cols):
                     gains[idx] = val
                 else:
                     raise ValueError(
-                        f"Feature index {idx} out of range for {len(FEATURE_COLS)} "
+                        f"Feature index {idx} out of range for {len(feature_cols)} "
                         f"features (fold {fold_num}, {task})"
                     )
             else:
                 raise ValueError(
                     f"Unrecognized feature key '{key}' from XGBoost model "
-                    f"(fold {fold_num}, {task}). Expected a FEATURE_COLS name or "
-                    f"'f<N>' positional key."
+                    f"(fold {fold_num}, {task})."
                 )
 
         importances_by_fold[fold_num] = gains
 
-    fi_df = pd.DataFrame(importances_by_fold, index=FEATURE_COLS)
+    fi_df = pd.DataFrame(importances_by_fold, index=feature_cols)
     fi_df.columns = [f"fold_{i}" for i in fi_df.columns]
     fi_df["mean"] = fi_df.mean(axis=1)
     fi_df = fi_df.sort_values("mean", ascending=False)
-
     return fi_df
 
 
-def plot_feature_importance(fi_df, task, output_path):
-    """Save a horizontal bar chart of aggregated feature importance."""
+def plot_feature_importance(fi_df, task, variant, output_path):
     fig, ax = plt.subplots(figsize=(10, 8))
 
     features_sorted = fi_df.index.tolist()
@@ -343,92 +417,100 @@ def plot_feature_importance(fi_df, task, output_path):
     ax.barh(range(len(features_sorted)), means, color="steelblue")
     ax.set_yticks(range(len(features_sorted)))
     ax.set_yticklabels(features_sorted)
-    ax.invert_yaxis()  # highest importance at top
+    ax.invert_yaxis()
     ax.set_xlabel("Mean gain across 8 folds")
-    ax.set_title(f"Feature importance (gain) — {task}")
+    ax.set_title(f"Feature importance (gain) — {task} — {variant}")
     ax.grid(alpha=0.3, axis="x")
-
     fig.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Feature importance chart saved to {output_path}")
 
 
-def go_no_go(summary):
-    """Print a go/no-go recommendation based on regression IC and ICIR.
+# ---- Go/no-go ----
 
-    Thresholds sourced from equity quant literature:
-      Green  (proceed):  IC >= 0.03 AND ICIR >= 0.40
-      Yellow (marginal): IC >= 0.01 AND ICIR >= 0.20
-      Red    (rework):   below yellow
-    """
+def classify_verdict(mean_ic, icir):
+    """Return verdict string based on thresholds."""
+    if pd.isna(mean_ic) or pd.isna(icir):
+        return "N/A"
+    if mean_ic >= IC_GREEN and icir >= ICIR_GREEN:
+        return "GREEN"
+    elif mean_ic >= IC_YELLOW and icir >= ICIR_YELLOW:
+        return "YELLOW"
+    else:
+        return "RED"
+
+
+def go_no_go(summary, variant, horizon):
     ic = summary["mean_ic_pooled"]
     icir = summary["icir_pooled"]
+    verdict = classify_verdict(ic, icir)
 
     print("\n" + "=" * 60)
-    print("STAGE 3 → STAGE 4 DECISION")
+    print(f"STAGE 3 → STAGE 4 DECISION ({variant}, {horizon} horizon)")
     print("=" * 60)
 
-    if ic >= IC_GREEN and icir >= ICIR_GREEN:
-        verdict = "GREEN — proceed to Stage 4 (portfolio optimization)"
+    if verdict == "GREEN":
+        full = "GREEN — proceed to Stage 4 (portfolio optimization)"
         reason = f"IC={ic:+.4f} >= {IC_GREEN}, ICIR={icir:+.3f} >= {ICIR_GREEN}"
-    elif ic >= IC_YELLOW and icir >= ICIR_YELLOW:
-        verdict = "YELLOW — marginal; consider adding features before proceeding"
+    elif verdict == "YELLOW":
+        full = "YELLOW — marginal; consider adding features before proceeding"
         reason = f"IC={ic:+.4f}, ICIR={icir:+.3f} (below green but above red)"
+    elif verdict == "N/A":
+        full = "N/A — verdict could not be computed"
+        reason = f"IC={ic}, ICIR={icir} (NaN in one or both metrics)"
     else:
-        verdict = "RED — signal too weak; add features or redesign approach"
+        full = "RED — signal too weak; add features or redesign approach"
         reason = f"IC={ic:+.4f}, ICIR={icir:+.3f} (below yellow thresholds)"
 
-    print(f"\n  Verdict: {verdict}")
+    print(f"\n  Verdict: {full}")
     print(f"  Reason:  {reason}")
 
-    if verdict.startswith("RED"):
-        print(f"\n  Suggested next steps:")
-        print(f"  1. Review feature importance charts — is any feature dominant?")
-        print(f"  2. Consider v2 features: cross-sectional rank-transforms,")
-        print(f"     sector-excess returns, additional technical indicators.")
-        print(f"  3. Check per-fold breakdown — is signal time-varying?")
 
+# ---- Single-variant evaluation ----
 
-def main():
-    """Orchestrate the full evaluation pipeline."""
+def evaluate_variant(variant):
+    """Run full evaluation on a single variant."""
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    config = get_variant_config(variant)
 
-    df = load_predictions()
+    print(f"\n{'='*60}")
+    print(f"EVALUATING VARIANT: {variant} ({config['horizon']} horizon)")
+    print(f"  Actual column:  {config['actual_return_col']}")
+    print(f"{'='*60}\n")
 
-    # Regression metrics
-    reg_summary, reg_per_fold = regression_metrics(df)
-    print_regression_report(reg_summary, reg_per_fold)
+    df = load_predictions(config)
 
-    # Classification metrics
+    # Regression (variant-specific horizon)
+    reg_summary, reg_per_fold = regression_metrics(df, config["actual_return_col"])
+    print_regression_report(reg_summary, reg_per_fold, config["horizon"])
+
+    # Classification (always 21-day drawdown)
     clf_summary, clf_per_fold = classification_metrics(df)
     print_classification_report(clf_summary, clf_per_fold)
 
-    # Calibration plot
+    # Charts
     print("\n" + "=" * 60)
     print("GENERATING CHARTS")
     print("=" * 60 + "\n")
-    plot_calibration(df, CALIBRATION_PLOT)
+    plot_calibration(df, config["calibration_plot"])
 
-    # Feature importance for both models
     print("\nComputing feature importance...")
-    fi_reg = compute_feature_importance("regression")
-    fi_clf = compute_feature_importance("classification")
-    plot_feature_importance(fi_reg, "regression", FI_REG_PLOT)
-    plot_feature_importance(fi_clf, "classification", FI_CLF_PLOT)
+    fi_reg = compute_feature_importance(config["models_dir"], config["feature_cols"], "regression")
+    fi_clf = compute_feature_importance(config["models_dir"], config["feature_cols"], "classification")
+    plot_feature_importance(fi_reg, "regression", variant, config["fi_reg_plot"])
+    plot_feature_importance(fi_clf, "classification", variant, config["fi_clf_plot"])
 
-    # Sanity-check that regression and classification have the same folds
-    # before merging. Catches partial-rerun / corrupted-input scenarios.
+    # Fold alignment check before merging
     reg_folds = set(reg_per_fold["fold"].astype(int))
     clf_folds = set(clf_per_fold["fold"].astype(int))
     if reg_folds != clf_folds:
         raise ValueError(
-            f"Fold mismatch between regression and classification metrics. "
-            f"Regression folds: {sorted(reg_folds)}, "
-            f"Classification folds: {sorted(clf_folds)}"
+            f"Fold mismatch: regression folds {sorted(reg_folds)}, "
+            f"classification folds {sorted(clf_folds)}"
         )
 
-    # Save summary CSV with all metrics
+    # Per-fold summary CSV
     summary_rows = []
     for _, row in reg_per_fold.iterrows():
         summary_rows.append({
@@ -442,23 +524,175 @@ def main():
             "auc": "classification_auc",
             "brier": "classification_brier",
             "pos_rate": "classification_pos_rate",
-            "n_obs": "n_obs",
         }).drop(columns=["n_obs"]).assign(fold=lambda d: d["fold"].astype(int)),
         on="fold",
     )
-    summary_df.to_csv(SUMMARY_FILE, index=False)
-    print(f"\n  Per-fold summary saved to {SUMMARY_FILE}")
+    summary_df.to_csv(config["summary_csv"], index=False)
+    print(f"\n  Per-fold summary saved to {config['summary_csv']}")
 
-    # Save top features to summary too
     print(f"\nTop 5 features (regression, by mean gain):")
     for feat, gain in fi_reg["mean"].head(5).items():
-        print(f"    {feat:<35} {gain:>10.2f}")
+        print(f"    {feat:<35} {gain:>10.4f}")
     print(f"\nTop 5 features (classification, by mean gain):")
     for feat, gain in fi_clf["mean"].head(5).items():
-        print(f"    {feat:<35} {gain:>10.2f}")
+        print(f"    {feat:<35} {gain:>10.4f}")
 
-    # Go/no-go
-    go_no_go(reg_summary)
+    go_no_go(reg_summary, variant, config["horizon"])
+
+
+# ---- Compare mode ----
+
+def detect_available_variants():
+    """Return a list of variants whose predictions file exists on disk."""
+    return [
+        v for v in ALL_VARIANTS
+        if (PREDICTIONS_DIR / f"cv_predictions_{v}.parquet").exists()
+    ]
+
+
+def compute_variant_summary(variant):
+    """Compute pooled metrics for one variant (used in compare mode)."""
+    config = get_variant_config(variant)
+    df = pd.read_parquet(config["predictions_file"])
+
+    if config["actual_return_col"] not in df.columns:
+        raise ValueError(
+            f"Predictions file for {variant} is missing column "
+            f"'{config['actual_return_col']}'. Re-run train.py --variant {variant}."
+        )
+
+    reg_summary, reg_per_fold = regression_metrics(df, config["actual_return_col"])
+    clf_summary, _ = classification_metrics(df)
+
+    verdict = classify_verdict(
+        reg_summary["mean_ic_pooled"], reg_summary["icir_pooled"]
+    )
+
+    row = {
+        "variant": variant,
+        "horizon": config["horizon"],
+        "mean_ic": reg_summary["mean_ic_pooled"],
+        "icir": reg_summary["icir_pooled"],
+        "worst_fold_ic": reg_summary["worst_fold_ic"],
+        "best_fold_ic": reg_summary["best_fold_ic"],
+        "auc": clf_summary["auc_pooled"],
+        "brier": clf_summary["brier_pooled"],
+        "verdict": verdict,
+        "stage4_ready": config["stage4_ready"],
+        "notes": config["notes"],
+    }
+    return row, reg_per_fold[["fold", "mean_ic"]]
+
+
+def plot_variant_comparison(per_fold_by_variant, output_path):
+    """Line chart: per-fold mean IC by variant."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.axhline(0, color="black", linewidth=0.5)
+    ax.axhline(IC_GREEN, color="green", linestyle=":", linewidth=1, alpha=0.6,
+               label=f"IC={IC_GREEN} (green threshold)")
+    ax.axhline(IC_YELLOW, color="goldenrod", linestyle=":", linewidth=1, alpha=0.6,
+               label=f"IC={IC_YELLOW} (yellow threshold)")
+
+    colors = {
+        "v1": "#888888", "v2a": "#3b7dd8", "v2b": "#e07a3b",
+        "v2c": "#6b3bd8", "v2d": "#2ca02c", "v3a": "#d62728", "v3d": "#e377c2",
+    }
+    for variant, per_fold in per_fold_by_variant.items():
+        ax.plot(
+            per_fold["fold"], per_fold["mean_ic"],
+            marker="o", linewidth=2,
+            label=variant, color=colors.get(variant, "black"),
+        )
+
+    ax.set_xlabel("Fold (validation year 2015..2022)")
+    ax.set_ylabel("Mean IC on fold (each variant on its own horizon)")
+    ax.set_title("Per-fold regression IC across variants")
+    ax.set_xticks(range(1, 9))
+    ax.legend(loc="best")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Comparison chart saved to {output_path}")
+
+
+def compare_variants():
+    """Compare all available variants side-by-side."""
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    available = detect_available_variants()
+    if len(available) < 2:
+        raise ValueError(
+            f"Need at least 2 variants to compare; found {len(available)}: {available}"
+        )
+
+    print(f"\n{'='*60}")
+    print(f"VARIANT COMPARISON")
+    print(f"Detected: {', '.join(available)}")
+    print(f"{'='*60}\n")
+
+    rows = []
+    per_fold_by_variant = {}
+    for variant in available:
+        row, per_fold = compute_variant_summary(variant)
+        rows.append(row)
+        per_fold_by_variant[variant] = per_fold
+
+    comp_df = pd.DataFrame(rows)
+
+    # Crown a best variant per horizon — cross-horizon comparisons of IC
+    # aren't apples-to-apples since each variant's IC is measured against
+    # its own forward-return horizon.
+    best_by_horizon = {}  # horizon -> variant name
+    for horizon, group in comp_df.groupby("horizon"):
+        best_idx = group["mean_ic"].idxmax()
+        best_by_horizon[horizon] = comp_df.loc[best_idx, "variant"]
+
+    # Print the table — mark the best variant WITHIN each horizon group
+    print(f"{'Variant':<7} {'Horiz':>6} {'Mean IC':>9} {'ICIR':>7} {'Worst IC':>9} "
+          f"{'AUC':>7} {'Brier':>7} {'Verdict':>8} {'Stage4':>8}  Notes")
+    print("-" * 105)
+    for _, row in comp_df.iterrows():
+        is_best_in_horizon = row["variant"] == best_by_horizon.get(row["horizon"])
+        marker = " ←" if is_best_in_horizon else ""
+        print(
+            f"{row['variant']:<7} "
+            f"{row['horizon']:>6} "
+            f"{row['mean_ic']:>+9.4f} "
+            f"{row['icir']:>+7.3f} "
+            f"{row['worst_fold_ic']:>+9.4f} "
+            f"{row['auc']:>7.4f} "
+            f"{row['brier']:>7.4f} "
+            f"{row['verdict']:>8} "
+            f"{row['stage4_ready']:>8}  "
+            f"{row['notes']}{marker}"
+        )
+
+    print(f"\nBest variant per horizon (cross-horizon IC is NOT directly comparable):")
+    for horizon in sorted(best_by_horizon.keys()):
+        print(f"  {horizon}: {best_by_horizon[horizon]}")
+
+    comp_df.to_csv(RESULTS_DIR / "variant_comparison.csv", index=False)
+    print(f"\nComparison CSV saved to {RESULTS_DIR / 'variant_comparison.csv'}")
+
+    plot_variant_comparison(
+        per_fold_by_variant,
+        RESULTS_DIR / "variant_comparison_ic.png",
+    )
+
+    print(f"\nNote: 'best' is chosen by pooled mean IC on {len(available)} variants. "
+          f"Differences below ~0.005 IC may not be statistically meaningful; "
+          f"bootstrap confidence intervals are a candidate future extension.")
+
+
+# ---- Entry point ----
+
+def main():
+    args = parse_args()
+    if args.compare:
+        compare_variants()
+    else:
+        evaluate_variant(args.variant)
 
 
 if __name__ == "__main__":

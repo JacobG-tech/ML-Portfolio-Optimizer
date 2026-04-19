@@ -16,6 +16,7 @@ from features import (
 )
 from targets import (
     add_target_ret_21d,
+    add_target_ret_63d,
     add_target_dd5_21d,
     add_target_ret_21d_rank,
 )
@@ -28,7 +29,6 @@ TRAINING_FILE = OUTPUT_DIR / "features_training.parquet"
 PREDICTION_FILE = OUTPUT_DIR / "features_prediction.parquet"
 
 # Canonical GICS sectors. Must match the set produced by add_sector.py.
-# Kept here (not imported) to keep build_features.py self-contained.
 CANONICAL_GICS_SECTORS = [
     "communication_services",
     "consumer_discretionary",
@@ -59,11 +59,6 @@ def attach_sector(panel):
     Adds a raw `sector` string column (for LightGBM's native categorical
     handling) and 11 one-hot columns named sector_<name> (for XGBoost,
     which requires numeric features).
-
-    One-hots are generated for ALL 11 canonical GICS sectors regardless
-    of which are present in the data, so the column set is fixed across
-    runs. This prevents surprises if the universe ever drops the last
-    ticker in a sparse sector (e.g., Materials).
     """
     sectors = pd.read_csv(SECTORS_FILE)
     panel = panel.merge(sectors, on="ticker", how="left")
@@ -121,6 +116,7 @@ def build_features():
 
     print("Computing targets...")
     panel = add_target_ret_21d(panel)
+    panel = add_target_ret_63d(panel)
     panel = add_target_dd5_21d(panel)
     panel = add_target_ret_21d_rank(panel)
 
@@ -130,17 +126,15 @@ def build_features():
 def split_and_save(panel):
     """Split the panel into training-ready and prediction-ready outputs.
 
-    Training: rows with all features AND both targets present. Used to fit
+    Training: rows with all features AND all targets present. Used to fit
     the ML models.
 
-    Prediction: rows with all features but no targets (the last 21 rows
-    per ticker, where we can't know forward returns yet). Used at inference
-    time to generate signals for the most recent dates.
+    Prediction: rows with all features but at least one target missing
+    (the last 63 rows per ticker — now bounded by the longest forward
+    target, not 21).
     """
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Original v1 numeric features (kept for ablation; v2 training can
-    # choose to use these or their rank-transformed versions).
     numeric_feature_cols = [
         "ret_21d", "ret_63d", "ret_252d", "price_to_sma50",
         "vol_20d", "range_pct_20d", "max_dd_90d",
@@ -149,12 +143,9 @@ def split_and_save(panel):
         "volume_ratio_20d",
         "sector_excess_ret_21d",
     ]
-    # Rank-transformed versions (v2 feature set)
     rank_feature_cols = [f"{c}_rank" for c in numeric_feature_cols]
     sector_onehot_cols = [f"sector_{s}" for s in CANONICAL_GICS_SECTORS]
 
-    # For training set inclusion: require ALL columns to be non-NaN
-    # (rows with missing features anywhere can't be used by any v2 variant).
     feature_cols = (
         numeric_feature_cols
         + rank_feature_cols
@@ -162,16 +153,18 @@ def split_and_save(panel):
         + ["sector"]
     )
 
-    target_cols = ["target_ret_21d", "target_dd5_21d", "target_ret_21d_rank"]
+    # All four targets must be non-NaN for training. Since target_ret_63d
+    # has the longest forward window (63 days), it's the binding constraint.
+    target_cols = [
+        "target_ret_21d",
+        "target_ret_63d",
+        "target_dd5_21d",
+        "target_ret_21d_rank",
+    ]
 
-    # Rows must have every feature present to be useful
     feature_complete = panel[feature_cols].notna().all(axis=1)
-
-    # Training set: features complete AND targets present
     target_complete = panel[target_cols].notna().all(axis=1)
     training = panel[feature_complete & target_complete].copy()
-
-    # Prediction set: features complete but at least one target missing
     prediction = panel[feature_complete & ~target_complete].copy()
 
     training.to_parquet(TRAINING_FILE)
@@ -185,6 +178,8 @@ def split_and_save(panel):
           f"{len(rank_feature_cols)} rank-transformed + "
           f"{len(sector_onehot_cols)} sector one-hot + 1 raw sector string "
           f"= {len(feature_cols)}")
+    print(f"  Targets: {len(target_cols)} "
+          f"(21d return, 63d return, 21d drawdown, 21d return rank)")
 
     print(f"\nPrediction set: {PREDICTION_FILE}")
     print(f"  Rows: {len(prediction):,}")
