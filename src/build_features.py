@@ -11,10 +11,13 @@ from features import (
     add_macd_hist,
     add_atr_14_pct,
     add_volume_ratio_20d,
+    add_rank_features,
+    add_sector_excess_ret_21d,
 )
 from targets import (
     add_target_ret_21d,
     add_target_dd5_21d,
+    add_target_ret_21d_rank,
 )
 
 PANEL_FILE = Path("data/processed/panel.parquet")
@@ -102,9 +105,24 @@ def build_features():
     panel = add_atr_14_pct(panel)
     panel = add_volume_ratio_20d(panel)
 
+    print("Computing sector-excess feature...")
+    panel = add_sector_excess_ret_21d(panel)
+
+    print("Rank-transforming numeric features...")
+    numeric_features_to_rank = [
+        "ret_21d", "ret_63d", "ret_252d", "price_to_sma50",
+        "vol_20d", "range_pct_20d", "max_dd_90d",
+        "beta_60d", "excess_ret_21d",
+        "rsi_14", "bb_position_20", "macd_hist", "atr_14_pct",
+        "volume_ratio_20d",
+        "sector_excess_ret_21d",
+    ]
+    panel = add_rank_features(panel, numeric_features_to_rank)
+
     print("Computing targets...")
     panel = add_target_ret_21d(panel)
     panel = add_target_dd5_21d(panel)
+    panel = add_target_ret_21d_rank(panel)
 
     return panel
 
@@ -121,17 +139,30 @@ def split_and_save(panel):
     """
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Original v1 numeric features (kept for ablation; v2 training can
+    # choose to use these or their rank-transformed versions).
     numeric_feature_cols = [
         "ret_21d", "ret_63d", "ret_252d", "price_to_sma50",
         "vol_20d", "range_pct_20d", "max_dd_90d",
         "beta_60d", "excess_ret_21d",
         "rsi_14", "bb_position_20", "macd_hist", "atr_14_pct",
         "volume_ratio_20d",
+        "sector_excess_ret_21d",
     ]
+    # Rank-transformed versions (v2 feature set)
+    rank_feature_cols = [f"{c}_rank" for c in numeric_feature_cols]
     sector_onehot_cols = [f"sector_{s}" for s in CANONICAL_GICS_SECTORS]
-    feature_cols = numeric_feature_cols + sector_onehot_cols + ["sector"]
 
-    target_cols = ["target_ret_21d", "target_dd5_21d"]
+    # For training set inclusion: require ALL columns to be non-NaN
+    # (rows with missing features anywhere can't be used by any v2 variant).
+    feature_cols = (
+        numeric_feature_cols
+        + rank_feature_cols
+        + sector_onehot_cols
+        + ["sector"]
+    )
+
+    target_cols = ["target_ret_21d", "target_dd5_21d", "target_ret_21d_rank"]
 
     # Rows must have every feature present to be useful
     feature_complete = panel[feature_cols].notna().all(axis=1)
@@ -150,7 +181,10 @@ def split_and_save(panel):
     print(f"  Rows: {len(training):,}")
     print(f"  Date range: {training['date'].min().date()} to {training['date'].max().date()}")
     print(f"  target_dd5_21d positive rate: {training['target_dd5_21d'].mean():.1%}")
-    print(f"  Feature columns: {len(numeric_feature_cols)} numeric + {len(sector_onehot_cols)} one-hot + 1 raw sector string = {len(feature_cols)}")
+    print(f"  Feature columns: {len(numeric_feature_cols)} raw numeric + "
+          f"{len(rank_feature_cols)} rank-transformed + "
+          f"{len(sector_onehot_cols)} sector one-hot + 1 raw sector string "
+          f"= {len(feature_cols)}")
 
     print(f"\nPrediction set: {PREDICTION_FILE}")
     print(f"  Rows: {len(prediction):,}")

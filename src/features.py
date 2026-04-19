@@ -217,3 +217,106 @@ def add_volume_ratio_20d(panel, window=20):
         .transform(lambda x: x / x.rolling(window).mean())
     )
     return panel
+
+def add_rank_features(panel, feature_cols):
+    """Add per-date cross-sectional rank-transformed versions of features.
+
+    For each date, each feature value is replaced by its rank across all
+    tickers on that date, normalized to [0, 1] via rank/(N-1). This makes
+    features regime-invariant: a rank of 0.9 means "top 10% of today's
+    universe" regardless of whether today is a calm market or a crash.
+
+    Ties are handled with method='average' (standard quant convention).
+    NaN values stay NaN — ranking only happens among non-NaN values on
+    each date. Rows with missing features will be filtered by the
+    downstream notna() check in build_features.py.
+
+    Parameters
+    ----------
+    panel : pd.DataFrame
+        Must contain 'date' and all columns named in feature_cols.
+    feature_cols : list of str
+        Feature column names to rank-transform. Does NOT include sector
+        one-hots (those are binary and shouldn't be ranked) or target
+        columns (those get a separate rank transform in targets.py).
+
+    Returns
+    -------
+    panel : pd.DataFrame
+        Same DataFrame with new columns '{feature}_rank' added, one per
+        input column.
+    """
+    for feat in feature_cols:
+        if feat not in panel.columns:
+            raise ValueError(f"Feature '{feat}' not in panel; can't rank-transform.")
+
+        panel[f"{feat}_rank"] = (
+            panel.groupby("date")[feat]
+            .transform(lambda x: x.rank(method="average", pct=True))
+        )
+
+    return panel
+
+def add_sector_excess_ret_21d(panel):
+    """Add sector_excess_ret_21d: ticker's 21-day return minus that day's
+    sector-average 21-day return.
+
+    This captures "is this stock outperforming its sector peers" rather
+    than just "is this stock going up." Distinct from excess_ret_21d
+    (which uses SPY as the benchmark) — this uses same-sector peers,
+    letting the model learn within-sector stock selection signal.
+
+    The sector average on date T is computed cross-sectionally using
+    only same-date values of ret_21d — no future leakage.
+
+    Requires ret_21d and sector columns to already exist on the panel.
+    Call AFTER add_return_features and AFTER attach_sector.
+    """
+    if "ret_21d" not in panel.columns:
+        raise ValueError(
+            "add_sector_excess_ret_21d requires 'ret_21d'. "
+            "Call add_return_features first."
+        )
+    if "sector" not in panel.columns:
+        raise ValueError(
+            "add_sector_excess_ret_21d requires 'sector' column. "
+            "Call attach_sector first."
+        )
+
+    # Compute the sector-average ret_21d for each (date, sector) pair,
+    # then broadcast back to every row that shares that (date, sector).
+    sector_avg = (
+        panel.groupby(["date", "sector"])["ret_21d"]
+        .transform("mean")
+    )
+
+    panel["sector_excess_ret_21d"] = panel["ret_21d"] - sector_avg
+
+    return panel
+
+def add_target_ret_21d_rank(panel):
+    """Add target_ret_21d_rank: per-date cross-sectional rank of target_ret_21d.
+
+    This is the same metric our evaluation uses (Spearman rank IC), directly
+    baked into a training target. Training against this aligns the loss
+    function (MSE) with the evaluation metric (rank correlation) — addresses
+    the loss/metric mismatch ChatGPT flagged in v1.
+
+    Ranks are normalized to [0, 1] via method='average' with pct=True,
+    matching the rank transform used for features. NaN inputs stay NaN
+    (last 21 rows per ticker, where forward returns can't be computed).
+
+    Requires target_ret_21d to already exist. Call AFTER add_target_ret_21d.
+    """
+    if "target_ret_21d" not in panel.columns:
+        raise ValueError(
+            "add_target_ret_21d_rank requires 'target_ret_21d'. "
+            "Call add_target_ret_21d first."
+        )
+
+    panel["target_ret_21d_rank"] = (
+        panel.groupby("date")["target_ret_21d"]
+        .transform(lambda x: x.rank(method="average", pct=True))
+    )
+
+    return panel
